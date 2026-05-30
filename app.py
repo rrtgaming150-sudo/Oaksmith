@@ -14,12 +14,12 @@ from threading import Lock
 # ================== CONFIGURATION ==================
 BASE_URL = "https://www.ssw.theofferclub.in"
 OTP_ENDPOINT = f"{BASE_URL}/home/generateOTP"
-TEST_MOBILE = "9738772627"
+TEST_MOBILE = "9028584228"
 
-NUM_CODES = 300
-MAX_WORKERS = 10
-DELAY_PER_THREAD = 0.7
-STATUS_INTERVAL = 100
+NUM_CODES = 100000
+MAX_WORKERS = 8
+DELAY_PER_THREAD = 2.0
+STATUS_INTERVAL = 500
 
 # Telegram Configuration
 TELEGRAM_TOKEN = "8789555036:AAGw-EovbhVHoI81lD6QJ9AeFhn4eJNnFaY"
